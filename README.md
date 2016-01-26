@@ -1,11 +1,11 @@
 # Foreman utilities to operate on host records.
 
-### List identifier name of the primary NIC, and 
+#### List identifier name of the primary NIC, and 
 ```bash
 foreman-utils.py --user <user> --password <password> --server <server> show_nics --filter 'domain = <domain>' --per-page 200
 ```
 
-### Clean (remove) all NICs except the primary interface, or interfaces with DNS associated with them.
+#### Clean (remove) all NICs except the primary interface, or interfaces with DNS associated with them.
 ```bash
 foreman-utils.py --user <user> --password <password> --server <server> clean_nics --filter 'domain = <domain>' --per-page 200
 ```
@@ -17,6 +17,7 @@ foreman-utils.py --user <user> --password <password> --server <server> clean_nic
 
 
 Command line options can be replaced using ENV variables instead.  The ENV variable name is prefixed with "FOREMANTOOLS" and the entire thing is capitalized, for example:
+
 export FOREMANTOOLS_USER=myuser
 export FOREMANTOOLS_PASSWORD=mypassword
 

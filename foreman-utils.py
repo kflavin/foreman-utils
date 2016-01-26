@@ -39,11 +39,18 @@ def main(debug, user, password, server):
 @click.option('--filter', default="os !~ Xen")
 @click.option('--per-page', default=10)
 @click.option('--max-page', default=-1)
-def clean_nics(all, filter, per_page, max_page):
+@click.option('-y', is_flag=True, default=False, prompt="Changes requested!  Are you sure?", help="Respond 'y' to any prompts.")
+def clean_nics(all, filter, per_page, max_page, y):
     """
     Cleanup all NICs on hosts specified by "filter". All non-primary NICs with no DNS will be removed,
     and the primary NIC will be renamed to "bond0" if it's currently "eth0".
     """
+
+    # If the user didn't specify to continue
+    if not y:
+        print "No changes made."
+        return
+
     # Assume everything if no filter is specified
     if all and not filter:
         filter = ""
@@ -58,8 +65,8 @@ def clean_nics(all, filter, per_page, max_page):
     total_hosts = output['total']
     subtotal = output['subtotal']
 
-    print "Total hosts is %s, Subtotal is: %s" % (total_hosts, subtotal,)
     last_page = total_hosts / per_page if total_hosts % per_page == 0 else (total_hosts / per_page) + 1
+    print "Total hosts is %s, Subtotal is: %s, Last page is: %s" % (total_hosts, subtotal,last_page,)
 
     # Pull in results from Foreman and gather into one list
     for current_page in xrange(2,last_page):
@@ -105,6 +112,7 @@ def clean_nics(all, filter, per_page, max_page):
             output = make_request(modify_interfaces_endpoint % (host_id,other), request_type="delete")
             if "error" in output:
                 removals.append("!%s" % other)
+                print "Error removing", output
             else:
                 removals.append("%s" % other)
             #print output
@@ -122,6 +130,7 @@ def clean_nics(all, filter, per_page, max_page):
             output = make_request(modify_interfaces_endpoint % (host_id, primary['id']), data=json.dumps(data), content_json=True, request_type="put")
             if "error" in output:
                 renames.append("!%s" % primary['id'])
+                print "Error renaming", output
             else:
                 renames.append("%s" % primary['id'])
             #print output
@@ -211,6 +220,35 @@ def create(*args, **kwargs):
 
 @click.command()
 @click.option('--all', is_flag=True, default=False)
+@click.option('--filter', default="")
+@click.option('--per-page', default=20)
+@click.option('--max-page', default=-1)
+def show_hosts(all, filter, per_page, max_page):
+    # give a list of hosts from a query
+
+    data = {'per_page': per_page, 'page': 1, 'search':filter}
+
+    hosts = []
+    output = make_request(hosts_endpoint, data)
+    hosts.extend(output['results'])
+    total_hosts = output['total']
+    subtotal = output['subtotal']
+    last_page = total_hosts / per_page if total_hosts % per_page == 0 else (total_hosts / per_page) + 1
+    print "Total hosts is %s, Subtotal is: %s, Last page is: %s" % (total_hosts, subtotal,last_page,)
+    for current_page in xrange(2,last_page):
+        data['page'] = current_page
+        output = make_request(hosts_endpoint, data)
+        hosts.extend(output['results'])
+        
+        #testing...
+        if max_page != -1 and current_page >= max_page:
+            break
+
+    for host in hosts:
+        print host['name']
+
+@click.command()
+@click.option('--all', is_flag=True, default=False)
 @click.option('--filter', default="os !~ Xen")
 @click.option('--per-page', default=20)
 @click.option('--max-page', default=-1)
@@ -228,8 +266,8 @@ def show_nics(all, filter, per_page, max_page):
     hosts.extend(output['results'])
     total_hosts = output['total']
     subtotal = output['subtotal']
-    print "Total hosts is %s, Subtotal is: %s" % (total_hosts, subtotal,)
     last_page = total_hosts / per_page if total_hosts % per_page == 0 else (total_hosts / per_page) + 1
+    print "Total hosts is %s, Subtotal is: %s, Last page is: %s" % (total_hosts, subtotal,last_page,)
     for current_page in xrange(2,last_page):
         data['page'] = current_page
         output = make_request(hosts_endpoint, data)
@@ -292,6 +330,7 @@ def show_nics(all, filter, per_page, max_page):
 main.add_command(create)
 main.add_command(clean_nics)
 main.add_command(show_nics)
+main.add_command(show_hosts)
 
 if __name__ == '__main__':
     main(auto_envvar_prefix=shell_prefix)

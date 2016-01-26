@@ -21,6 +21,7 @@ protocol = "https"
 base_endpoint = "/api"
 hosts_endpoint = base_endpoint + "/hosts"
 interfaces_endpoint = base_endpoint + "/hosts/%s/interfaces"
+modify_interfaces_endpoint = base_endpoint + "/hosts/%s/interfaces/%s"
 
 @click.group()
 @click.option("--debug", is_flag=True, default=False)
@@ -35,7 +36,9 @@ def main(debug, user, password, server):
 @click.command()
 @click.option('--all', is_flag=True, default=False)
 @click.option('--name')
-def rename(all, name):
+@click.option('--filter', default="os !~ Xen")
+@click.option('--per-page', default=20)
+def rename(all, name, filter, per_page):
     if name:
         data = {"search": "name=%s" % name}
         # Get Host id
@@ -56,43 +59,52 @@ def rename(all, name):
             if interface['primary'] == 1:
                 primary = interface
     elif all:
-        data = {'per_page': 10, 'page': 1, 'search':'os !~ Xen' }
-        # Get Host id'searchs
+        #per_page = 10
+        data = {'per_page': per_page, 'page': 1, 'search':filter}
+        # Get Host id's
         hosts = []
         output = make_request(hosts_endpoint, data)
         hosts.extend(output['results'])
         total_hosts = output['total']
-        current_page=2
-        for i in xrange(1,total_hosts):
+        print "Total hosts is %s" % total_hosts
+        last_page = total_hosts / per_page if total_hosts % per_page == 0 else (total_hosts / per_page) + 1
+        for current_page in xrange(2,last_page):
             data['page'] = current_page
             output = make_request(hosts_endpoint, data)
             hosts.extend(output['results'])
-            current_page+=1
             print "current length", len(hosts), "len of hosts retrieved", len(output['results']), "total", total_hosts
             
             #testing...
-            if i == 2:
+            if current_page == 2:
                 break
 
 
-        for host in hosts:
+        for c,host in enumerate(hosts):
             # Get interfaces of host
-            output = make_request(interfaces_endpoint%host['id'])
+            host_id = host['id']
+            output = make_request(interfaces_endpoint % host_id)
             interfaces = output['results']
-            print host['name']
+            print "%-5s %-50s" % (c, host['name'],),
             # find the primary and secondary, and conflicting ips or macs
+            others = []
             for interface in interfaces:
                 #print interface['identifier']
                 # Skip Xen
                 if interface['identifier'].startswith("xapi") or \
                    interface['identifier'].startswith("xenbr"):
-                    print "FOUND XEN SERVER"
                     continue
 
                 if interface['primary'] == 1:
                     primary = interface
+                else:
+                    # Gather list of interfaces to remove.  Don't remove anything that's been given a DNS name, or that is managed.
+                    if not interface['name'] and not interface['managed']:
+                        others.append(interface['id'])
 
             # find anything that conflicts with primary
+            ip_conflicts = 0
+            mac_conflicts = 0
+            name_conflicts = 0
             for interface in interfaces:
                 ips_match   = False
                 macs_match  = False
@@ -101,19 +113,40 @@ def rename(all, name):
                 if interface['identifier'] != primary['identifier']:
                     if interface['ip'] == primary['ip']:
                         ips_match = True
+                        ip_conflicts += 1
                     if interface['mac'] == primary['mac']:
                         macs_match = True
+                        mac_conflicts += 1
                     if interface['name'] == primary['name']:
                         names_match = True
+                        name_conflicts += 1
 
-                    print "prim: %s sec: %s ips: %s macs: %s names: %s" % (primary['identifier'], interface['identifier'], ips_match, macs_match, names_match,)
-
-                    # For matching secondaries, rename the interface and remove the IP
+                    #print "prim: %s, sec: %s, ips: %s, macs: %s, names: %s" % (primary['identifier'], interface['identifier'], ips_match, macs_match, names_match,)
+            print "prim: %-10s IP: %-5s Mac: %-5s Name: %-5s" % (primary['identifier'], ip_conflicts, mac_conflicts, name_conflicts,),
 
             print
+            print "Keeping Host ID: %s Nic ID: %s" % (primary['name'], primary['id'])
+            for i,other in enumerate(others):
+                print "Removing Host ID: %s Nic ID: %s" % (host_id,other)
+                output = make_request(modify_interfaces_endpoint % (host_id,other), request_type="delete")
+                print output
+                #print others
+
+            # Rename the primary, and change it to a bond, if necessary
+            if primary['identifier'] == 'eth0':
+                print "Renaming Host ID: %s Nic ID: %s" % (host_id, primary['id'])
+                data = {}
+                data['type'] = "bond"
+                data['mode'] = 'active-backup'
+                data['identifier'] = 'bond0'
+                data['attached_devices'] = "eth0, eth1"
+                output = make_request(modify_interfaces_endpoint % (host_id, primary['id']), data=json.dumps(data), content_json=True, request_type="put")
+                print output
+
+            #print
 
     
-def make_request(endpoint, data=None, content_json=False):
+def make_request(endpoint, data=None, content_json=False, request_type="get"):
     """
     Generic request maker
     """
@@ -125,14 +158,15 @@ def make_request(endpoint, data=None, content_json=False):
         headers['Content-Type'] = 'application/json'
 
     try:
-        r = requests.get(url, headers=headers, auth=auth, verify=False, data=data)
+        call_foreman = getattr(requests, request_type)
+        r = call_foreman(url, headers=headers, auth=auth, verify=False, data=data)
     except ConnectionError:
         print "Could not connect to %s" % foreman_server
         sys.exit(1)
 
     output = json.loads(r.text)
     if "error" in output:
-        return output['error']['message']
+        return output
     else:
         return output
 
@@ -192,9 +226,113 @@ def create(*args, **kwargs):
             cmd += " --%s=%s" %(key, value,)
         print cmd
 
+@click.command()
+@click.option('--all', is_flag=True, default=False)
+@click.option('--name')
+@click.option('--filter', default="os !~ Xen")
+@click.option('--per-page', default=20)
+def show_dupe_nics(all, name, filter, per_page):
+    if name:
+        data = {"search": "name=%s" % name}
+        # Get Host id
+        output = make_request(hosts_endpoint, data)
+        id = output['results'][0]['id']
+        # Get interfaces of host
+        output = make_request(interfaces_endpoint%id, data)
+        interfaces = output['results']
+        # find the primary and secondary, and conflicting ips or macs
+        print name,
+        for interface in interfaces:
+            print interface['identifier'],
+            # Skip Xen
+            if interface['identifier'].startswith("xapi") or \
+               interface['identifier'].startswith("xenbr"):
+                continue
+
+            if interface['primary'] == 1:
+                primary = interface
+    elif all:
+        #per_page = 10
+        data = {'per_page': per_page, 'page': 1, 'search':filter}
+        # Get Host id's
+        hosts = []
+        output = make_request(hosts_endpoint, data)
+        hosts.extend(output['results'])
+        total_hosts = output['total']
+        print "Total hosts is %s" % total_hosts
+        last_page = total_hosts / per_page if total_hosts % per_page == 0 else (total_hosts / per_page) + 1
+        for current_page in xrange(2,last_page):
+            data['page'] = current_page
+            output = make_request(hosts_endpoint, data)
+            hosts.extend(output['results'])
+            print "current length", len(hosts), "len of hosts retrieved", len(output['results']), "total", total_hosts
+            
+            #testing...
+            if current_page == 2:
+                break
+
+
+        for c,host in enumerate(hosts):
+            # Get interfaces of host
+            host_id = host['id']
+            output = make_request(interfaces_endpoint % host_id)
+            interfaces = output['results']
+            print "%-5s %-50s" % (c, host['name'],),
+            # find the primary and secondary, and conflicting ips or macs
+            others = []
+            for interface in interfaces:
+                #print interface['identifier']
+                # Skip Xen
+                if interface['identifier'].startswith("xapi") or \
+                   interface['identifier'].startswith("xenbr"):
+                    continue
+
+                if interface['primary'] == 1:
+                    primary = interface
+                else:
+                    # Gather list of interfaces to remove.  Don't remove anything that's been given a DNS name, or that is managed.
+                    if not interface['name'] and not interface['managed']:
+                        others.append(interface['id'])
+
+            # find anything that conflicts with primary
+            ip_conflicts = 0
+            mac_conflicts = 0
+            name_conflicts = 0
+            for interface in interfaces:
+                ips_match   = False
+                macs_match  = False
+                names_match = False
+                # Find all cases where the interface matches another
+                if interface['identifier'] != primary['identifier']:
+                    if interface['ip'] == primary['ip']:
+                        ips_match = True
+                        ip_conflicts += 1
+                    if interface['mac'] == primary['mac']:
+                        macs_match = True
+                        mac_conflicts += 1
+                    if interface['name'] == primary['name']:
+                        names_match = True
+                        name_conflicts += 1
+
+                    #print "prim: %s, sec: %s, ips: %s, macs: %s, names: %s" % (primary['identifier'], interface['identifier'], ips_match, macs_match, names_match,)
+            print "prim: %-10s IP: %-5s Mac: %-5s Name: %-5s" % (primary['identifier'], ip_conflicts, mac_conflicts, name_conflicts,),
+
+            print
+            print "Keeping Host ID: %s Nic ID: %s" % (primary['name'], primary['id'])
+            for i,other in enumerate(others):
+                print "Removing Host ID: %s Nic ID: %s" % (host_id,other[1])
+                output = make_request(modify_interfaces_endpoint % (host_id,other[1]), request_type="delete")
+                print output
+                #print others
+
+                    # For matching secondaries, rename the interface and remove the IP
+
+            #print
+
 
 main.add_command(create)
 main.add_command(rename)
+main.add_command(show_dupe_nics)
 
 if __name__ == '__main__':
     main(auto_envvar_prefix=shell_prefix)

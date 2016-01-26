@@ -1,11 +1,11 @@
 # Foreman utilities to operate on host records.
 
-#### List identifier name of the primary NIC, and 
+** List identifier name of the primary NIC, and number of duplicates. **
 ```bash
 foreman-utils.py --user <user> --password <password> --server <server> show_nics --filter 'domain = <domain>' --per-page 200
 ```
 
-#### Clean (remove) all NICs except the primary interface, or interfaces with DNS associated with them.
+** Clean (remove) all NICs except the primary interface, or interfaces with DNS associated with them. **
 ```bash
 foreman-utils.py --user <user> --password <password> --server <server> clean_nics --filter 'domain = <domain>' --per-page 200
 ```

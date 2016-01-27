@@ -10,6 +10,7 @@ from requests.exceptions import ConnectionError
 requests.packages.urllib3.disable_warnings()
 import json
 import sys
+import os
 import click
 from requests.auth import HTTPBasicAuth
 
@@ -17,43 +18,56 @@ shell_prefix = 'FOREMANTOOLS'
 auth = None
 foreman_server = None
 protocol = "https"
+foreman_user = None
+foreman_password = None
 
+# Foreman API endpoints
 base_endpoint = "/api"
 hosts_endpoint = base_endpoint + "/hosts"
 interfaces_endpoint = base_endpoint + "/hosts/%s/interfaces"
 modify_interfaces_endpoint = base_endpoint + "/hosts/%s/interfaces/%s"
+
+###############################################
+# Commands / Subcommands
+###############################################
 
 @click.group()
 @click.option("--debug", is_flag=True, default=False)
 @click.option('--user', '-u') #, prompt=True)
 @click.option('--password', '-p', hide_input=True) #, prompt=True)
 @click.option('--server', '-s')
-def main(debug, user, password, server):
+@click.option('--per-page', default=500)
+@click.option('--max-page', default=-1)
+@click.pass_context
+def main(ctx, debug, user, password, server, per_page, max_page):
     global auth, foreman_server
     auth = HTTPBasicAuth(user, password)
     foreman_server = server
 
-@click.command()
-@click.option('--all', is_flag=True, default=False)
-#@click.option('--name')
-@click.option('--filter', default="os !~ Xen")
-@click.option('--per-page', default=10)
-@click.option('--max-page', default=-1)
+    # Setup context variables
+    ctx.obj['per_page'] = per_page
+    ctx.obj['max_page'] = max_page
+
+@main.command()
+@click.option('--from-nic', help="Name of primary NIC that is subject to rename.  If not specified, will do ALL (ie: eth0, eth1, xenapi1, etc)")
+@click.option('--to-nic', default="bond0", help="Name that primary NIC should become.  If not specified, use bond0.")
+@click.option('--all', is_flag=True, default=False, help="Rename primary NIC to <from-nic> regardless of its name.")
+@click.option('--attached-devices', help="Attached devices.  Used for bonds.  Specify as a comma separated list, ie: 'eth0,eth1'")
+@click.option('--filter', default="os !~ Xen", help="A foreman-API-compatible filter.")
 @click.option('-y', is_flag=True, default=False, prompt="Changes requested!  Are you sure?", help="Respond 'y' to any prompts.")
-def clean_nics(all, filter, per_page, max_page, y):
+@click.pass_context
+def clean_nics(ctx, from_nic, to_nic, all, attached_devices, filter, per_page, max_page, y):
     """
     Cleanup all NICs on hosts specified by "filter". All non-primary NICs with no DNS will be removed,
-    and the primary NIC will be renamed to "bond0" if it's currently "eth0".
+    and the primary NIC will be renamed "<from_nic>" to "<to_nic>".
     """
+    per_page = ctx.obj['per_page']
+    max_page = ctx.obj['max_page']
+    attached_devices_cleaned = ", ".join([ad.strip() for ad in attached_devices.split(",")]) if attached_devices else None
+    if not all and not from_nic:
+        from_nic = "eth0"
 
-    # If the user didn't specify to continue
-    if not y:
-        print "No changes made."
-        return
-
-    # Assume everything if no filter is specified
-    if all and not filter:
-        filter = ""
+    print "Updating %s to %s with attached devices: %s" % (from_nic if from_nic else "ALL NICS", to_nic, attached_devices_cleaned,)
 
     #per_page = 10
     data = {'per_page': per_page, 'page': 1, 'search':filter}
@@ -65,8 +79,14 @@ def clean_nics(all, filter, per_page, max_page, y):
     total_hosts = output['total']
     subtotal = output['subtotal']
 
-    last_page = total_hosts / per_page if total_hosts % per_page == 0 else (total_hosts / per_page) + 1
+    last_page = subtotal / per_page if subtotal % per_page == 0 else (subtotal / per_page) + 1
     print "Total hosts is %s, Subtotal is: %s, Last page is: %s" % (total_hosts, subtotal,last_page,)
+
+    # If the user didn't specify to continue
+    if not y:
+        print
+        print "No changes made."
+        return
 
     # Pull in results from Foreman and gather into one list
     for current_page in xrange(2,last_page):
@@ -91,16 +111,12 @@ def clean_nics(all, filter, per_page, max_page, y):
         others = []
         for interface in interfaces:
             #print interface['identifier']
-            # Skip Xen
-            if interface['identifier'].startswith("xapi") or \
-               interface['identifier'].startswith("xenbr"):
-                continue
 
             if interface['primary'] == 1:
                 primary = interface
             else:
                 # Gather list of interfaces to remove.  Don't remove anything that's been given a DNS name, or that is managed.
-                if not interface['name'] and not interface['managed']:
+                if not interface['name'] and not interface['managed'] and not interface['name']:
                     others.append(interface['id'])
 
         #print
@@ -118,15 +134,21 @@ def clean_nics(all, filter, per_page, max_page, y):
             #print output
             #print others
 
-        renames = []
         # Rename the primary, and change it to a bond, if necessary
-        if primary['identifier'] == 'eth0':
-            #print "Renaming Host ID: %s Nic ID: %s" % (host_id, primary['id'])
+        renames = []
+        if primary['identifier'] == from_nic or all:
+            # Setup data with updated parameters
             data = {}
-            data['type'] = "bond"
-            data['mode'] = 'active-backup'
-            data['identifier'] = 'bond0'
-            data['attached_devices'] = "eth0, eth1"
+            data['identifier'] = to_nic
+
+            # Is it a bond or regular interface?
+            if to_nic.startswith("bond"):
+                data['type'] = "bond"
+                data['mode'] = 'active-backup'
+                data['attached_devices'] = attached_devices_cleaned
+            else:
+                data['type'] = "interface"
+
             output = make_request(modify_interfaces_endpoint % (host_id, primary['id']), data=json.dumps(data), content_json=True, request_type="put")
             if "error" in output:
                 renames.append("!%s" % primary['id'])
@@ -138,31 +160,7 @@ def clean_nics(all, filter, per_page, max_page, y):
         print "%-4s %-7s %-50s renamed: %s removed: %s" % (c, host_id, host_name, renames, removals)
 
     
-def make_request(endpoint, data=None, content_json=False, request_type="get"):
-    """
-    Generic request maker
-    """
-    global auth, foreman_server, protocol
-    headers = {'Accept': "version=2,application/json"} 
-    url = "%s://%s%s" % (protocol, foreman_server, endpoint)
-
-    if content_json:
-        headers['Content-Type'] = 'application/json'
-
-    try:
-        call_foreman = getattr(requests, request_type)
-        r = call_foreman(url, headers=headers, auth=auth, verify=False, data=data)
-    except ConnectionError:
-        print "Could not connect to %s" % foreman_server
-        sys.exit(1)
-
-    output = json.loads(r.text)
-    if "error" in output:
-        return output
-    else:
-        return output
-
-@click.command()
+@main.command()
 @click.option('--server', '-s', prompt=True)
 @click.option('--identifier', '-i', prompt=True)
 @click.option('--ip', prompt=True)
@@ -171,7 +169,8 @@ def make_request(endpoint, data=None, content_json=False, request_type="get"):
 @click.option('--primary', is_flag=True, default=False)
 @click.option('--printenv', is_flag=True, default=False)
 @click.option('--printcmd', is_flag=True, default=False)
-def create(*args, **kwargs):
+@click.pass_context
+def create(ctx, *args, **kwargs):
     headers = {'Accept': "version=2,application/json"} 
     url = "https://%s/api/hosts" % kwargs.get('server')
     try:
@@ -218,66 +217,63 @@ def create(*args, **kwargs):
             cmd += " --%s=%s" %(key, value,)
         print cmd
 
-@click.command()
+@main.command()
 @click.option('--all', is_flag=True, default=False)
 @click.option('--filter', default="")
-@click.option('--per-page', default=20)
-@click.option('--max-page', default=-1)
-def show_hosts(all, filter, per_page, max_page):
-    # give a list of hosts from a query
-
-    data = {'per_page': per_page, 'page': 1, 'search':filter}
-
-    hosts = []
-    output = make_request(hosts_endpoint, data)
-    hosts.extend(output['results'])
-    total_hosts = output['total']
-    subtotal = output['subtotal']
-    last_page = total_hosts / per_page if total_hosts % per_page == 0 else (total_hosts / per_page) + 1
-    print "Total hosts is %s, Subtotal is: %s, Last page is: %s" % (total_hosts, subtotal,last_page,)
-    for current_page in xrange(2,last_page):
-        data['page'] = current_page
-        output = make_request(hosts_endpoint, data)
-        hosts.extend(output['results'])
-        
-        #testing...
-        if max_page != -1 and current_page >= max_page:
-            break
+@click.pass_context
+def show_hosts(ctx, all, filter):
+    hosts = get_hosts(ctx, filter)
 
     for host in hosts:
         print host['name']
 
-@click.command()
-@click.option('--all', is_flag=True, default=False)
-@click.option('--filter', default="os !~ Xen")
-@click.option('--per-page', default=20)
-@click.option('--max-page', default=-1)
-def show_nics(all, filter, per_page, max_page):
-    # Assume everything if no filter is specified
-    if all and not filter:
-        filter = ""
-
-    #per_page = 10
-    data = {'per_page': per_page, 'page': 1, 'search':filter}
-
-    # Get Host id's
+@main.command()
+@click.option('--filter')
+@click.option('--from-file')
+@click.pass_context
+def show_dupe_ips(ctx, filter, from_file):
+    """
+    Given hosts from a filter or file, show any duplicate IP's in Foreman
+    """
     hosts = []
-    output = make_request(hosts_endpoint, data)
-    hosts.extend(output['results'])
-    total_hosts = output['total']
-    subtotal = output['subtotal']
-    last_page = total_hosts / per_page if total_hosts % per_page == 0 else (total_hosts / per_page) + 1
-    print "Total hosts is %s, Subtotal is: %s, Last page is: %s" % (total_hosts, subtotal,last_page,)
-    for current_page in xrange(2,last_page):
-        data['page'] = current_page
-        output = make_request(hosts_endpoint, data)
-        hosts.extend(output['results'])
-        #print "current length", len(hosts), "len of hosts retrieved", len(output['results']), "total", total_hosts
-        
-        #testing...
-        if max_page != -1 and current_page >= max_page:
-            break
+    if from_file and os.path.exists(from_file):
+        with open(from_file, "r") as f:
+            content = f.read()
 
+        hosts.extend(content.strip().split("\n"))
+
+    if filter:
+        host_objs = get_hosts(ctx, filter, quiet=True)
+        for obj in host_objs:
+            if obj:
+                hosts.append(obj['name'])
+
+    print "Looking up %s hosts." %  len(hosts)
+
+    for host in hosts:
+        host_obj = get_hosts(ctx, filter='name=%s'%host, quiet=True)
+        ip = host_obj[0]['ip']
+        all = get_hosts(ctx, filter='ip=%s'%ip, quiet=True)
+
+        # Print the number of duplicates, the duplicate IP, and host names
+        print len(all), ip, 
+        for one in all:
+            print one['name'],
+
+        print
+
+
+
+@main.command()
+#@click.option('--all', is_flag=True, default=False)
+@click.option('--filter', default="os !~ Xen")
+@click.pass_context
+def show_nics(ctx, filter):
+    # Assume everything if no filter is specified
+    #if all and not filter:
+        #filter = ""
+
+    hosts = get_hosts(ctx, filter)
 
     for c,host in enumerate(hosts):
         # Get interfaces of host
@@ -288,12 +284,6 @@ def show_nics(all, filter, per_page, max_page):
         # find the primary and secondary, and conflicting ips or macs
         others = []
         for interface in interfaces:
-            #print interface['identifier']
-            # Skip Xen
-            if interface['identifier'].startswith("xapi") or \
-               interface['identifier'].startswith("xenbr"):
-                continue
-
             if interface['primary'] == 1:
                 primary = interface
             else:
@@ -324,13 +314,71 @@ def show_nics(all, filter, per_page, max_page):
                 #print "prim: %s, sec: %s, ips: %s, macs: %s, names: %s" % (primary['identifier'], interface['identifier'], ips_match, macs_match, names_match,)
         print "prim: %-6s IP: %-3s Mac: %-3s Name: %-3s %s" % (primary['identifier'], ip_conflicts, mac_conflicts, name_conflicts,others,)
 
-        #print
+
+###############################################
+# Utility Functions
+###############################################
+
+def get_hosts(ctx, filter, quiet=False):
+    """
+    Retrieve list of hosts from Foreman
+    """
+    per_page = ctx.obj['per_page']
+    max_page = ctx.obj['max_page']
+
+    #per_page = 10
+    data = {'per_page': per_page, 'page': 1, 'search':filter}
+
+    # Get Host id's
+    hosts = []
+    output = make_request(hosts_endpoint, data)
+    hosts.extend(output['results'])
+    total_hosts = output['total']
+    subtotal = output['subtotal']
+    last_page = subtotal / per_page if subtotal % per_page == 0 else (subtotal / per_page) + 1
+    if not quiet:
+        print "Total hosts is %s, Subtotal is: %s, Last page is: %s" % (total_hosts, subtotal,last_page,)
+    for current_page in xrange(2,last_page):
+        data['page'] = current_page
+        output = make_request(hosts_endpoint, data)
+        hosts.extend(output['results'])
+        
+        #testing...
+        if max_page != -1 and current_page >= max_page:
+            break
+
+    return hosts
 
 
-main.add_command(create)
-main.add_command(clean_nics)
-main.add_command(show_nics)
-main.add_command(show_hosts)
+def make_request(endpoint, data=None, content_json=False, request_type="get"):
+    """
+    Generic request maker
+    """
+    global auth, foreman_server, protocol
+    headers = {'Accept': "version=2,application/json"} 
+    url = "%s://%s%s" % (protocol, foreman_server, endpoint)
+
+    if content_json:
+        headers['Content-Type'] = 'application/json'
+
+    try:
+        call_foreman = getattr(requests, request_type)
+        r = call_foreman(url, headers=headers, auth=auth, verify=False, data=data)
+    except ConnectionError:
+        print "Could not connect to %s" % foreman_server
+        sys.exit(1)
+
+    output = json.loads(r.text)
+    if "error" in output:
+        return output
+    else:
+        return output
+
+
+#main.add_command(create)
+#main.add_command(clean_nics)
+#main.add_command(show_nics)
+#main.add_command(show_hosts)
 
 if __name__ == '__main__':
-    main(auto_envvar_prefix=shell_prefix)
+    main(obj={}, auto_envvar_prefix=shell_prefix)

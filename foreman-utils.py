@@ -11,6 +11,7 @@ requests.packages.urllib3.disable_warnings()
 import json
 import sys
 import os
+import re
 import click
 from requests.auth import HTTPBasicAuth
 
@@ -26,6 +27,7 @@ base_endpoint = "/api"
 hosts_endpoint = base_endpoint + "/hosts"
 interfaces_endpoint = base_endpoint + "/hosts/%s/interfaces"
 modify_interfaces_endpoint = base_endpoint + "/hosts/%s/interfaces/%s"
+subnet_endpoint = base_endpoint + "/subnets"
 
 ###############################################
 # Commands / Subcommands
@@ -149,7 +151,7 @@ def clean_nics(ctx, from_nic, to_nic, all, attached_devices, filter, per_page, m
             else:
                 data['type'] = "interface"
 
-            output = make_request(modify_interfaces_endpoint % (host_id, primary['id']), data=json.dumps(data), content_json=True, request_type="put")
+            output = make_request(modify_interfaces_endpoint % (host_id, primary['id']), data=data, content_json=True, request_type="put")
             if "error" in output:
                 renames.append("!%s" % primary['id'])
                 print "Error renaming", output
@@ -262,6 +264,46 @@ def show_dupe_ips(ctx, filter, from_file):
 
         print
 
+@main.command()
+@click.option('--filter', default="os !~ Xen")
+@click.pass_context
+def show_subnets(ctx, filter):
+    subnets = make_request(subnet_endpoint)['results']
+    for subnet in subnets:
+        print "%-50s %-20s/%s" % (subnet['name'], subnet['network'], subnet['mask'],)
+
+@main.command()
+@click.option('--from-file')
+@click.pass_context
+def create_subnets(ctx, from_file):
+    subnet = {}
+    subnet['name'] = "10.230.0.0"
+    subnet['network'] = "10.230.0.0"
+    subnet['mask'] = "255.255.255.252"
+    subnet['gateway'] = "10.230.0.1"
+    subnet['dns_primary'] = "10.1.90.19"
+    subnet['ipam'] = "DHCP"
+    subnet['domain_ids'] = [2649, 2701, 2702,]
+    #subnet['dhcp_ids'] = 8
+    #subnet['tftp_id'] = 8
+    #subnet['dns_id'] = 8
+    subnet['boot_mode'] = "DHCP"
+
+    from pprint import pprint
+    pprint(subnet); 
+    output = make_request(subnet_endpoint, data=subnet, content_json=True, request_type='post')
+    print output
+
+@main.command()
+@click.option('--filter', required=True, help="Set a filter, ie: 'name = myhost.example.org'.")
+@click.pass_context
+def change_host_network(ctx, filter):
+    hosts = get_hosts(ctx, filter)
+
+    #for c,host in enumerate(hosts):
+
+
+
 
 
 @main.command()
@@ -269,10 +311,6 @@ def show_dupe_ips(ctx, filter, from_file):
 @click.option('--filter', default="os !~ Xen")
 @click.pass_context
 def show_nics(ctx, filter):
-    # Assume everything if no filter is specified
-    #if all and not filter:
-        #filter = ""
-
     hosts = get_hosts(ctx, filter)
 
     for c,host in enumerate(hosts):
@@ -359,6 +397,7 @@ def make_request(endpoint, data=None, content_json=False, request_type="get"):
     url = "%s://%s%s" % (protocol, foreman_server, endpoint)
 
     if content_json:
+        data = json.dumps(data)
         headers['Content-Type'] = 'application/json'
 
     try:
@@ -373,6 +412,49 @@ def make_request(endpoint, data=None, content_json=False, request_type="get"):
         return output
     else:
         return output
+
+###############################################
+# DHCP Specific functions
+###############################################
+
+class Subnet(object):
+    def __init__(self, network, mask, gateway):
+        self.network = network
+        self.mask = mask
+        self.gateway = gateway
+
+@main.command()
+@click.option("--filename", type=click.Path(exists=True))
+def dhcp_parser(filename):
+    with open(filename, "r") as f:
+        counter = 0
+
+        subnets = []
+        l = f.readline()
+        while l:
+            lines = []
+            if re.match('^ +subnet ', l):
+                while not re.match('^ +}', l):
+                    lines.append(l.strip())
+                    l = f.readline()
+                subnets.append(lines)
+
+            l = f.readline()
+        #print subnets[0]
+        #print len(subnets)
+
+        for subnet in subnets:
+            #print subnet
+            network = subnet[0].split()[1]
+            mask1 = subnet[0].split()[3]
+            mask2 = subnet[1].split()[2].strip(";")
+            router = subnet[2].split()[2].strip(";")
+            print network, mask2, router
+            #if mask1 != mask2:
+                #print "No match", network, mask1, mask2
+            #network, mask = subnet.split()[1], subnet.split()[3]
+            #router = subnet.split()[2]
+
 
 
 #main.add_command(create)

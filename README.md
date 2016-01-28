@@ -10,12 +10,12 @@ foreman-utils.py --user <user> --password <password> --server <server> show_nics
 foreman-utils.py --user <user> --password <password> --server <server> clean_nics --filter 'model = Proliant' --per-page 200
 ```
 
-** Show duplicate IP's from file, or from a file, or both. (Note: this is slow; 2 API queries per host.)
+**Show duplicate IP's from file, or from a file, or both. (Note: this is slow; 2 API queries per host.)**
 ```bash
 foreman-utils.py --user <user> --password <password> --server <server> show_dupe_ips --filter 'model !~ xen' --from-file list_of_hosts
 ```
 
-** Show hosts, given a filter.  (ie: Show names of all RedHat hosts)
+**Show hosts, given a filter.  (ie: Show names of all RedHat hosts)**
 ```bash
 foreman-utils.py --user <user> --password <password> --server <server> show_hosts --filter 'os ~ redhat'
 ```

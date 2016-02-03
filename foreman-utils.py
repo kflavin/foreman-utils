@@ -14,6 +14,7 @@ import os
 import re
 import click
 from requests.auth import HTTPBasicAuth
+from netaddr import IPAddress, IPNetwork
 
 shell_prefix = 'FOREMANTOOLS'
 auth = None
@@ -58,7 +59,7 @@ def main(ctx, debug, user, password, server, per_page, max_page):
 @click.option('--filter', default="os !~ Xen", help="A foreman-API-compatible filter.")
 @click.option('-y', is_flag=True, default=False, prompt="Changes requested!  Are you sure?", help="Respond 'y' to any prompts.")
 @click.pass_context
-def clean_nics(ctx, from_nic, to_nic, all, attached_devices, filter, per_page, max_page, y):
+def clean_nics(ctx, from_nic, to_nic, all, attached_devices, filter, y):
     """
     Cleanup all NICs on hosts specified by "filter". All non-primary NICs with no DNS will be removed,
     and the primary NIC will be renamed "<from_nic>" to "<to_nic>".
@@ -224,7 +225,7 @@ def create(ctx, *args, **kwargs):
 @click.option('--filter', default="")
 @click.pass_context
 def show_hosts(ctx, all, filter):
-    hosts = get_hosts(ctx, filter)
+    hosts = get_objs(ctx, hosts_endpoint, filter)
 
     for host in hosts:
         print host['name']
@@ -245,7 +246,7 @@ def show_dupe_ips(ctx, filter, from_file):
         hosts.extend(content.strip().split("\n"))
 
     if filter:
-        host_objs = get_hosts(ctx, filter, quiet=True)
+        host_objs = get_objs(ctx, hosts_endpoint, filter, quiet=True)
         for obj in host_objs:
             if obj:
                 hosts.append(obj['name'])
@@ -253,9 +254,9 @@ def show_dupe_ips(ctx, filter, from_file):
     print "Looking up %s hosts." %  len(hosts)
 
     for host in hosts:
-        host_obj = get_hosts(ctx, filter='name=%s'%host, quiet=True)
+        host_obj = get_objs(ctx, hosts_endpoint, filter='name=%s'%host, quiet=True)
         ip = host_obj[0]['ip']
-        all = get_hosts(ctx, filter='ip=%s'%ip, quiet=True)
+        all = get_objs(ctx, hosts_endpoint, filter='ip=%s'%ip, quiet=True)
 
         # Print the number of duplicates, the duplicate IP, and host names
         print len(all), ip, 
@@ -283,11 +284,12 @@ def create_subnets(ctx, from_file):
     subnet['gateway'] = "10.230.0.1"
     subnet['dns_primary'] = "10.1.90.19"
     subnet['ipam'] = "DHCP"
-    subnet['domain_ids'] = [2649, 2701, 2702,]
+    #subnet['domain_ids'] = [2649, 2701, 2702,]
     #subnet['dhcp_ids'] = 8
     #subnet['tftp_id'] = 8
     #subnet['dns_id'] = 8
     subnet['boot_mode'] = "DHCP"
+    subnet['domain_ids'] = [2649,]
 
     from pprint import pprint
     pprint(subnet); 
@@ -297,13 +299,108 @@ def create_subnets(ctx, from_file):
 @main.command()
 @click.option('--filter', required=True, help="Set a filter, ie: 'name = myhost.example.org'.")
 @click.pass_context
-def change_host_network(ctx, filter):
-    hosts = get_hosts(ctx, filter)
+def find_subnets(ctx, filter):
+    """
+    Print out given hosts, with current subnet, and subnet they should be on
+    """
+    hosts = get_objs(ctx, hosts_endpoint, filter)
+    subnets = get_objs(ctx, subnet_endpoint, quiet=True)
 
-    #for c,host in enumerate(hosts):
+    # For each host, find each subnet to which its primary NIC belongs.
+    for host in hosts:
+        ip = host['ip']
+        count = 0
+        nets = []
+        for subnet in subnets:
+            network = subnet['network']
+            mask = subnet['mask']
+            if ip is not None and \
+               IPAddress(ip) in IPNetwork("%s/%s" % (network, mask,)) and \
+               IPNetwork("%s/%s" % (network, mask,)) != IPNetwork("10.0.0.0/255.0.0.0"):
+                count += 1
+                nets.append((subnet['id'], "%s/%s" % (network, mask,)))
 
+        # If there are overlapping subnets, select the most specific one (largest mask)
+        largest = None
+        for i,net in enumerate(nets):
+            network = net[1].split("/")[0]
+            mask = net[1].split("/")[1]
+            if i == 0:
+                largest = (net[0], network, mask,)
+            if mask > largest[1]:
+                largest = (net[0], network, mask,)
 
+        # Get interfaces
+        interfaces = make_request(interfaces_endpoint % host['id'])['results']
 
+        # Update the primary interface with the correct subnet
+        current_id = None
+        if largest:
+            subnet_id = largest[0]
+            for interface in interfaces:
+                if interface['primary'] == 1:
+                    current_id =  interface['subnet_id']
+
+        #print "%-4s %-55s Selected: %-40s Choices: %s %s" % (count, host['name'], largest[1:], largest[0], " ".join(nets[1]),)
+        print "%-4s %-55s Current: %-5s Selected: %-40s Choices: %s" % (count, host['name'], current_id, largest, nets)
+        #print "%-4s %-15s %-55s ip: %-40s primary: %s" % (count, host['name'], largest, int, ip) #" ".join(nets),)
+
+@main.command()
+@click.option('--filter', required=True, help="Set a filter, ie: 'name = myhost.example.org'.")
+@click.pass_context
+def update_subnets(ctx, filter):
+    """
+    Print out given hosts, with current subnet, and subnet they should be on
+    """
+    hosts = get_objs(ctx, hosts_endpoint, filter)
+    subnets = get_objs(ctx, subnet_endpoint, quiet=True)
+
+    # For each host, find each subnet to which its primary NIC belongs.
+    for host in hosts:
+        ip = host['ip']
+        count = 0
+        nets = []
+        for subnet in subnets:
+            network = subnet['network']
+            mask = subnet['mask']
+            if ip is not None and \
+               IPAddress(ip) in IPNetwork("%s/%s" % (network, mask,)) and \
+               IPNetwork("%s/%s" % (network, mask,)) != IPNetwork("10.0.0.0/255.0.0.0"):
+                count += 1
+                nets.append((subnet['id'], "%s/%s" % (network, mask,)))
+
+        # If there are overlapping subnets, select the most specific one (largest mask)
+        largest = None
+        for i,net in enumerate(nets):
+            network = net[1].split("/")[0]
+            mask = net[1].split("/")[1]
+            if i == 0:
+                largest = (net[0], network, mask,)
+            if mask > largest[1]:
+                largest = (net[0], network, mask,)
+
+        # Get interfaces
+        interfaces = make_request(interfaces_endpoint % host['id'])['results']
+
+        # Update the primary interface with the correct subnet
+        if largest:
+            subnet_id = largest[0]
+            for interface in interfaces:
+                if interface['primary'] == 1:
+                    if subnet_id != interface['subnet_id']:
+                        data = {'subnet_id': subnet_id}
+                        print "%-55s %-15s changing from %-5s to %-5s" % (host['name'], ip, interface['subnet_id'], subnet_id)
+                        output = make_request(modify_interfaces_endpoint % (host['id'], interface['id'],), data=data, content_json=True, request_type='put')
+                        if "error" in output:
+                            print output
+                    else:
+                        print "No changes: %-55s %-15s" % (host['name'], ip,)
+        else:
+            print "No subnet: %-55s %-15s" % (host['name'], ip,)
+
+        #print "%-4s %-55s Selected: %-40s Choices: %s %s" % (count, host['name'], largest[1:], largest[0], " ".join(nets[1]),)
+        #print "%-4s %-55s Selected: %-40s Choices: %s" % (count, host['name'], largest, nets)
+        #print "%-4s %-15s %-55s ip: %-40s primary: %s" % (count, host['name'], largest, int, ip) #" ".join(nets),)
 
 
 @main.command()
@@ -311,7 +408,7 @@ def change_host_network(ctx, filter):
 @click.option('--filter', default="os !~ Xen")
 @click.pass_context
 def show_nics(ctx, filter):
-    hosts = get_hosts(ctx, filter)
+    hosts = get_objs(ctx, hosts_endpoint, filter)
 
     for c,host in enumerate(hosts):
         # Get interfaces of host
@@ -357,19 +454,23 @@ def show_nics(ctx, filter):
 # Utility Functions
 ###############################################
 
-def get_hosts(ctx, filter, quiet=False):
+
+def get_objs(ctx, endpoint, filter=None, quiet=False):
     """
-    Retrieve list of hosts from Foreman
+    Retrieve list of objects from Foreman, given an endpoint.
     """
     per_page = ctx.obj['per_page']
     max_page = ctx.obj['max_page']
 
     #per_page = 10
-    data = {'per_page': per_page, 'page': 1, 'search':filter}
+    if filter:
+        data = {'per_page': per_page, 'page': 1, 'search':filter}
+    else:
+        data = {'per_page': per_page, 'page': 1}
 
     # Get Host id's
     hosts = []
-    output = make_request(hosts_endpoint, data)
+    output = make_request(endpoint, data)
     hosts.extend(output['results'])
     total_hosts = output['total']
     subtotal = output['subtotal']
@@ -393,7 +494,7 @@ def make_request(endpoint, data=None, content_json=False, request_type="get"):
     Generic request maker
     """
     global auth, foreman_server, protocol
-    headers = {'Accept': "version=2,application/json"} 
+    headers = {'Accept': "version=2;application/json"} 
     url = "%s://%s%s" % (protocol, foreman_server, endpoint)
 
     if content_json:
@@ -401,6 +502,18 @@ def make_request(endpoint, data=None, content_json=False, request_type="get"):
         headers['Content-Type'] = 'application/json'
 
     try:
+        # remove
+        #req = requests.Request(request_type.upper(), url, headers=headers, auth=auth, data=data)
+        #prepared = req.prepare()
+        #print('{}\n{}\n{}\n\n{}\n{}'.format(
+                                        #'-----START-----',
+                                        #prepared.method + ' ' + prepared.url,
+                                        #'\n'.join('{}: {}'.format(k, v) for k, v in prepared.headers.items()),
+                                        #prepared.body,
+                                        #'-----END-----',
+                                        #))
+        # remove
+
         call_foreman = getattr(requests, request_type)
         r = call_foreman(url, headers=headers, auth=auth, verify=False, data=data)
     except ConnectionError:
@@ -426,6 +539,9 @@ class Subnet(object):
 @main.command()
 @click.option("--filename", type=click.Path(exists=True))
 def dhcp_parser(filename):
+    """
+    read a dhcpd.conf file and pull all of the subnets from it.
+    """
     with open(filename, "r") as f:
         counter = 0
 

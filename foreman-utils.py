@@ -26,6 +26,7 @@ foreman_password = None
 # Foreman API endpoints
 base_endpoint = "/api"
 hosts_endpoint = base_endpoint + "/hosts"
+modify_hosts_endpoint = base_endpoint + "/hosts/%s"
 interfaces_endpoint = base_endpoint + "/hosts/%s/interfaces"
 modify_interfaces_endpoint = base_endpoint + "/hosts/%s/interfaces/%s"
 subnet_endpoint = base_endpoint + "/subnets"
@@ -225,7 +226,7 @@ def create(ctx, *args, **kwargs):
 @click.option('--filter', default="")
 @click.pass_context
 def show_hosts(ctx, all, filter):
-    hosts = get_objs(ctx, hosts_endpoint, filter)
+    hosts = get_objs(hosts_endpoint, filter, ctx=ctx)
 
     for host in hosts:
         print host['name']
@@ -246,7 +247,7 @@ def show_dupe_ips(ctx, filter, from_file):
         hosts.extend(content.strip().split("\n"))
 
     if filter:
-        host_objs = get_objs(ctx, hosts_endpoint, filter, quiet=True)
+        host_objs = get_objs(hosts_endpoint, filter, quiet=True, ctx=ctx)
         for obj in host_objs:
             if obj:
                 hosts.append(obj['name'])
@@ -254,9 +255,9 @@ def show_dupe_ips(ctx, filter, from_file):
     print "Looking up %s hosts." %  len(hosts)
 
     for host in hosts:
-        host_obj = get_objs(ctx, hosts_endpoint, filter='name=%s'%host, quiet=True)
+        host_obj = get_objs(hosts_endpoint, filter='name=%s'%host, quiet=True, ctx=ctx)
         ip = host_obj[0]['ip']
-        all = get_objs(ctx, hosts_endpoint, filter='ip=%s'%ip, quiet=True)
+        all = get_objs(hosts_endpoint, filter='ip=%s'%ip, quiet=True, ctx=ctx)
 
         # Print the number of duplicates, the duplicate IP, and host names
         print len(all), ip, 
@@ -303,8 +304,8 @@ def find_subnets(ctx, filter):
     """
     Print out given hosts, with current subnet, and subnet they should be on
     """
-    hosts = get_objs(ctx, hosts_endpoint, filter)
-    subnets = get_objs(ctx, subnet_endpoint, quiet=True)
+    hosts = get_objs(hosts_endpoint, filter, ctx=ctx)
+    subnets = get_objs(subnet_endpoint, quiet=True, ctx=ctx)
 
     # For each host, find each subnet to which its primary NIC belongs.
     for host in hosts:
@@ -352,8 +353,8 @@ def update_subnets(ctx, filter):
     """
     Print out given hosts, with current subnet, and subnet they should be on
     """
-    hosts = get_objs(ctx, hosts_endpoint, filter)
-    subnets = get_objs(ctx, subnet_endpoint, quiet=True)
+    hosts = get_objs(hosts_endpoint, filter, ctx=ctx)
+    subnets = get_objs(subnet_endpoint, quiet=True, ctx=ctx)
 
     # For each host, find each subnet to which its primary NIC belongs.
     for host in hosts:
@@ -402,13 +403,87 @@ def update_subnets(ctx, filter):
         #print "%-4s %-55s Selected: %-40s Choices: %s" % (count, host['name'], largest, nets)
         #print "%-4s %-15s %-55s ip: %-40s primary: %s" % (count, host['name'], largest, int, ip) #" ".join(nets),)
 
+@main.command()
+@click.option('--filter', required=True, help="Set a filter, ie: 'name = myhost.example.org'.")
+@click.pass_context
+def create_dhcp(ctx, filter):
+    """
+    Switch a hosts subnets and make it managed, to recreate the DHCP record.
 
+    This will set the host's primary interface to its correct subnet, and make that interface managed and available for provisioning.
+    """
+    hosts = get_objs(hosts_endpoint, filter, ctx=ctx)
+    subnets = get_objs(subnet_endpoint, quiet=True, ctx=ctx)
+
+    for host in hosts:
+        # make host managed
+        data = {'managed': 'true'}
+        output = make_request(modify_hosts_endpoint % host['id'], data=data, content_json=True, request_type='put')
+        if "error" in output:
+            print output
+
+        interfaces = make_request(interfaces_endpoint % host['id'])['results']
+
+        # find primary interface
+        primary = None
+        for interface in interfaces:
+            if interface['primary'] == 1:
+                primary = interface
+
+        # Find the subnet the primary interface is one
+        network = None
+        for subnet in subnets:
+            if interface['subnet_id'] == subnet['id']:
+                network = subnet
+
+        # If we're on 10/8, switch to the right subnet.  Otherwise, switch to 10/8, then back to the right subnet.
+        data = {}
+        data['managed'] = True
+        data['provision'] = True
+        data['primary'] = True
+            
+        if network and network['network'] == '10.0.0.0':
+            # Just switch to the correct subnet
+            data['subnet_id'] = get_my_subnet(host['ip'], ctx=ctx)[0]
+            print "%s: switch to right subnet %s" % (host['name'], data['subnet_id'],)
+            output = make_request(modify_interfaces_endpoint % (host['id'], primary['id'],), data=data, content_json=True, request_type='put')
+            if "error" in output:
+                print output
+        else:
+            # Switch to 10/8 and back.
+
+            if not network:
+                network = get_my_subnet(primary['ip'], ctx=ctx)
+                my_net = network[1]
+                my_mask = network[2]
+            else:
+                my_net = network['network']
+                my_mask = network['mask']
+
+
+            default_subnet_id = get_subnet_id("10.0.0.0", "255.0.0.0", ctx)
+            target_subnet_id = get_subnet_id(my_net, my_mask, ctx)
+            print "%s: switching from the default network %s, back to %s, to create the DHCP record." % (host['name'], default_subnet_id, target_subnet_id,)
+
+            data['subnet_id'] = default_subnet_id
+            output = make_request(modify_interfaces_endpoint % (host['id'], primary['id'],), data=data, content_json=True, request_type='put')
+            if "error" in output:
+                print output
+                return
+
+            data['subnet_id'] = target_subnet_id
+            output = make_request(modify_interfaces_endpoint % (host['id'], primary['id'],), data=data, content_json=True, request_type='put')
+            if "error" in output:
+                print output
+
+
+        
 @main.command()
 #@click.option('--all', is_flag=True, default=False)
 @click.option('--filter', default="os !~ Xen")
 @click.pass_context
 def show_nics(ctx, filter):
-    hosts = get_objs(ctx, hosts_endpoint, filter)
+    hosts = get_objs(hosts_endpoint, filter, ctx=ctx)
 
     for c,host in enumerate(hosts):
         # Get interfaces of host
@@ -454,8 +529,55 @@ def show_nics(ctx, filter):
 # Utility Functions
 ###############################################
 
+def get_subnet_id(network, mask, ctx=None):
+    """
+    given a network and mask, find  and return the subnet id
+    """
+    filter = 'network = %s and mask = %s' % (network, mask,)
+    output = get_objs(subnet_endpoint, filter=filter, quiet=True, ctx=ctx)
+    if "error" in output:
+        print output
+        return None
 
-def get_objs(ctx, endpoint, filter=None, quiet=False):
+    # either we didn't find the subnet, or we found multiple subnets
+    if len(output) != 1:
+        return None
+
+    return output[0]['id']
+
+
+def get_my_subnet(ip, ctx=None):
+    """
+    Find the subnet from an IP address.  Exclude 10/8, since that's our generic network.
+    """
+    subnets = get_objs(subnet_endpoint, quiet=True, ctx=ctx)
+
+    # Find all matching subnets.  Skip 10.0.0.0/8
+    nets = []
+    count = 0
+    for subnet in subnets:
+        network = subnet['network']
+        mask = subnet['mask']
+        if ip is not None and \
+           IPAddress(ip) in IPNetwork("%s/%s" % (network, mask,)) and \
+           IPNetwork("%s/%s" % (network, mask,)) != IPNetwork("10.0.0.0/255.0.0.0"):
+            count += 1
+            nets.append((subnet['id'], "%s/%s" % (network, mask,)))
+
+    # If there are overlapping subnets, select the most specific one (largest mask)
+    largest = None
+    for i,net in enumerate(nets):
+        network = net[1].split("/")[0]
+        mask = net[1].split("/")[1]
+        if i == 0:
+            largest = (net[0], network, mask,)
+        if mask > largest[1]:
+            largest = (net[0], network, mask,)
+
+    return largest
+
+
+def get_objs(endpoint, filter=None, quiet=False, ctx=None):
     """
     Retrieve list of objects from Foreman, given an endpoint.
     """
@@ -469,24 +591,24 @@ def get_objs(ctx, endpoint, filter=None, quiet=False):
         data = {'per_page': per_page, 'page': 1}
 
     # Get Host id's
-    hosts = []
+    objs = []
     output = make_request(endpoint, data)
-    hosts.extend(output['results'])
-    total_hosts = output['total']
+    objs.extend(output['results'])
+    total_objs = output['total']
     subtotal = output['subtotal']
     last_page = subtotal / per_page if subtotal % per_page == 0 else (subtotal / per_page) + 1
     if not quiet:
-        print "Total hosts is %s, Subtotal is: %s, Last page is: %s" % (total_hosts, subtotal,last_page,)
+        print "Total is %s, Subtotal is: %s, Last page is: %s" % (total_objs, subtotal,last_page,)
     for current_page in xrange(2,last_page):
         data['page'] = current_page
-        output = make_request(hosts_endpoint, data)
-        hosts.extend(output['results'])
+        output = make_request(endpoint, data)
+        objs.extend(output['results'])
         
         #testing...
         if max_page != -1 and current_page >= max_page:
             break
 
-    return hosts
+    return objs
 
 
 def make_request(endpoint, data=None, content_json=False, request_type="get"):

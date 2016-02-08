@@ -463,7 +463,7 @@ def create_dhcp(ctx, filter):
 
             default_subnet_id = get_subnet_id("10.0.0.0", "255.0.0.0", ctx)
             target_subnet_id = get_subnet_id(my_net, my_mask, ctx)
-            print "%s: switching from the default network %s, back to %s, to create the DHCP record." % (host['name'], default_subnet_id, target_subnet_id,)
+            print "%s: toggling to default network %s, back to %s, to create the DHCP record." % (host['name'], default_subnet_id, target_subnet_id,)
 
             data['subnet_id'] = default_subnet_id
             output = make_request(modify_interfaces_endpoint % (host['id'], primary['id'],), data=data, content_json=True, request_type='put')

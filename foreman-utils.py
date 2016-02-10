@@ -13,8 +13,11 @@ import sys
 import os
 import re
 import click
+import logging
 from requests.auth import HTTPBasicAuth
 from netaddr import IPAddress, IPNetwork
+
+logger = logging.getLogger(__name__)
 
 shell_prefix = 'FOREMANTOOLS'
 auth = None
@@ -36,21 +39,34 @@ subnet_endpoint = base_endpoint + "/subnets"
 ###############################################
 
 @click.group()
-@click.option("--debug", is_flag=True, default=False)
+@click.option("--debug", type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']), default="WARNING")
 @click.option('--user', '-u') #, prompt=True)
 @click.option('--password', '-p', hide_input=True) #, prompt=True)
 @click.option('--server', '-s')
-@click.option('--per-page', default=500)
+@click.option('--per-page', default=100)
 @click.option('--max-page', default=-1)
 @click.pass_context
 def main(ctx, debug, user, password, server, per_page, max_page):
+    """
+    Various utilities for performing repetitive tasks against the Foreman API.
+    """
     global auth, foreman_server
     auth = HTTPBasicAuth(user, password)
     foreman_server = server
+    
+    # Configure logging
+    logger = logging.getLogger()
+    logger.setLevel(level=debug)
+    #fh = logging.FileHandler(log_file)
+    fh = logging.StreamHandler()
+    fh_formatter = logging.Formatter('%(asctime)s %(levelname)s %(lineno)d:%(filename)s(%(process)d) - %(message)s')
+    fh.setFormatter(fh_formatter)
+    logger.addHandler(fh)
 
     # Setup context variables
     ctx.obj['per_page'] = per_page
     ctx.obj['max_page'] = max_page
+    ctx.obj['debug'] = debug
 
 @main.command()
 @click.option('--from-nic', help="Name of primary NIC that is subject to rename.  If not specified, will do ALL (ie: eth0, eth1, xenapi1, etc)")
@@ -175,6 +191,9 @@ def clean_nics(ctx, from_nic, to_nic, all, attached_devices, filter, y):
 @click.option('--printcmd', is_flag=True, default=False)
 @click.pass_context
 def create(ctx, *args, **kwargs):
+    """
+    Add a NIC to a server (deprecated)
+    """
     headers = {'Accept': "version=2,application/json"} 
     url = "https://%s/api/hosts" % kwargs.get('server')
     try:
@@ -224,12 +243,21 @@ def create(ctx, *args, **kwargs):
 @main.command()
 @click.option('--all', is_flag=True, default=False)
 @click.option('--filter', default="")
+@click.option('--name-only', is_flag=True, default=False)
 @click.pass_context
-def show_hosts(ctx, all, filter):
+def show_hosts(ctx, all, filter, name_only):
+    """
+    Show hosts given a filter, and whether or not it is managed.
+    """
     hosts = get_objs(hosts_endpoint, filter, ctx=ctx)
 
     for host in hosts:
-        print host['name']
+        if name_only:
+            print host['name']
+        else:
+            print "Name: %-50s Managed: %-5s Provis: %-15s Subnet: %-4s Model: %-15s Cap: %s" % (host['name'], host['managed'],
+                                                                                                   host['provision_method'], host['subnet_id'],
+                                                                                                   host['model_name'], host['capabilities'],)
 
 @main.command()
 @click.option('--filter')
@@ -270,6 +298,9 @@ def show_dupe_ips(ctx, filter, from_file):
 @click.option('--filter', default="os !~ Xen")
 @click.pass_context
 def show_subnets(ctx, filter):
+    """
+    Show subnets.
+    """
     subnets = make_request(subnet_endpoint)['results']
     for subnet in subnets:
         print "%-50s %-20s/%s" % (subnet['name'], subnet['network'], subnet['mask'],)
@@ -278,6 +309,9 @@ def show_subnets(ctx, filter):
 @click.option('--from-file')
 @click.pass_context
 def create_subnets(ctx, from_file):
+    """
+    Test function for creating a subnet.  Not used; it won't do what you want.
+    """
     subnet = {}
     subnet['name'] = "10.230.0.0"
     subnet['network'] = "10.230.0.0"
@@ -412,17 +446,38 @@ def create_dhcp(ctx, filter):
 
     This will set the host's primary interface to its correct subnet, and make that interface managed and available for provisioning.
     """
+    logger.debug("Getting hosts")
+    sys.stdout.flush()
     hosts = get_objs(hosts_endpoint, filter, ctx=ctx)
+    logger.debug("Getting subnets")
+    sys.stdout.flush()
     subnets = get_objs(subnet_endpoint, quiet=True, ctx=ctx)
 
     for host in hosts:
-        # make host managed
-        data = {'managed': 'true'}
-        output = make_request(modify_hosts_endpoint % host['id'], data=data, content_json=True, request_type='put')
-        if "error" in output:
-            print output
 
-        interfaces = make_request(interfaces_endpoint % host['id'])['results']
+        # make host managed if it's not already
+        if not host['managed']:
+            print host['name'], "make host managed...",
+            data = {'managed': 'true'}
+            output = make_request(modify_hosts_endpoint % host['id'], data=data, content_json=True, request_type='put')
+
+            if "error" in output:
+                print "failed to manage" % host['name']
+                print output
+                sys.stdout.flush()
+                continue
+        else:
+            print host['name'],
+            sys.stdout.flush()
+
+        interfaces = make_request(interfaces_endpoint % host['id'])
+        if "results" in interfaces:
+            interfaces = interfaces['results']
+        else:
+            print "no interfaces found"
+            sys.stdout.flush()
+            continue
+
 
         # find primary interface
         primary = None
@@ -446,16 +501,24 @@ def create_dhcp(ctx, filter):
             # Just switch to the correct subnet
             data['subnet_id'] = get_my_subnet(host['ip'], ctx=ctx)[0]
             print "%s: switch to right subnet %s" % (host['name'], data['subnet_id'],)
+            sys.stdout.flush()
             output = make_request(modify_interfaces_endpoint % (host['id'], primary['id'],), data=data, content_json=True, request_type='put')
             if "error" in output:
                 print output
+                sys.stdout.flush()
+                continue
         else:
             # Switch to 10/8 and back.
 
             if not network:
                 network = get_my_subnet(primary['ip'], ctx=ctx)
-                my_net = network[1]
-                my_mask = network[2]
+                try:
+                    my_net = network[1]
+                    my_mask = network[2]
+                except TypeError:
+                    print "no network for %s" % host['name']
+                    sys.stdout.flush()
+                    continue
             else:
                 my_net = network['network']
                 my_mask = network['mask']
@@ -464,17 +527,20 @@ def create_dhcp(ctx, filter):
             default_subnet_id = get_subnet_id("10.0.0.0", "255.0.0.0", ctx)
             target_subnet_id = get_subnet_id(my_net, my_mask, ctx)
             print "%s: toggling to default network %s, back to %s, to create the DHCP record." % (host['name'], default_subnet_id, target_subnet_id,)
+            sys.stdout.flush()
 
             data['subnet_id'] = default_subnet_id
             output = make_request(modify_interfaces_endpoint % (host['id'], primary['id'],), data=data, content_json=True, request_type='put')
             if "error" in output:
                 print output
-                return
+                sys.stdout.flush()
+                continue
 
             data['subnet_id'] = target_subnet_id
             output = make_request(modify_interfaces_endpoint % (host['id'], primary['id'],), data=data, content_json=True, request_type='put')
             if "error" in output:
                 print output
+                sys.stdout.flush()
 
 
         
@@ -483,6 +549,9 @@ def create_dhcp(ctx, filter):
 @click.option('--filter', default="os !~ Xen")
 @click.pass_context
 def show_nics(ctx, filter):
+    """
+    Show NICs associated with hosts from a given filter.
+    """
     hosts = get_objs(hosts_endpoint, filter, ctx=ctx)
 
     for c,host in enumerate(hosts):
@@ -580,6 +649,8 @@ def get_my_subnet(ip, ctx=None):
 def get_objs(endpoint, filter=None, quiet=False, ctx=None):
     """
     Retrieve list of objects from Foreman, given an endpoint.
+
+    It needs to know from ctx, the total number of records, and th enumber of pages.
     """
     per_page = ctx.obj['per_page']
     max_page = ctx.obj['max_page']
@@ -593,6 +664,10 @@ def get_objs(endpoint, filter=None, quiet=False, ctx=None):
     # Get Host id's
     objs = []
     output = make_request(endpoint, data)
+    if "results" not in output:
+        print output
+        return objs
+
     objs.extend(output['results'])
     total_objs = output['total']
     subtotal = output['subtotal']
@@ -653,6 +728,9 @@ def make_request(endpoint, data=None, content_json=False, request_type="get"):
 ###############################################
 
 class Subnet(object):
+    """
+    Represent a Foreman subnetwork (presently unused)
+    """
     def __init__(self, network, mask, gateway):
         self.network = network
         self.mask = mask
@@ -662,7 +740,9 @@ class Subnet(object):
 @click.option("--filename", type=click.Path(exists=True))
 def dhcp_parser(filename):
     """
-    read a dhcpd.conf file and pull all of the subnets from it.
+    Read a dhcpd.conf file and pull all of the subnets from it.
+
+    Output is sent to stdout, formatted as follows: <network> <mask> <router>
     """
     with open(filename, "r") as f:
         counter = 0
@@ -701,4 +781,6 @@ def dhcp_parser(filename):
 #main.add_command(show_hosts)
 
 if __name__ == '__main__':
+    print "Starting..."
+
     main(obj={}, auto_envvar_prefix=shell_prefix)

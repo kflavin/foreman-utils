@@ -71,7 +71,7 @@ def main(ctx, debug, user, password, server, per_page, max_page):
 @main.command()
 @click.option('--from-nic', help="Name of primary NIC that is subject to rename.  If not specified, will do ALL (ie: eth0, eth1, xenapi1, etc)")
 @click.option('--to-nic', default="bond0", help="Name that primary NIC should become.  If not specified, use bond0.")
-@click.option('--all', is_flag=True, default=False, help="Rename primary NIC to <from-nic> regardless of its name.")
+@click.option('--all', is_flag=True, default=False, help="Rename primary NIC to <to-nic> regardless of its name.")
 @click.option('--attached-devices', help="Attached devices.  Used for bonds.  Specify as a comma separated list, ie: 'eth0,eth1'")
 @click.option('--filter', default="os !~ Xen", help="A foreman-API-compatible filter.")
 @click.option('-y', is_flag=True, default=False, prompt="Changes requested!  Are you sure?", help="Respond 'y' to any prompts.")
@@ -83,7 +83,7 @@ def clean_nics(ctx, from_nic, to_nic, all, attached_devices, filter, y):
     """
     per_page = ctx.obj['per_page']
     max_page = ctx.obj['max_page']
-    attached_devices_cleaned = ", ".join([ad.strip() for ad in attached_devices.split(",")]) if attached_devices else None
+    attached_devices_cleaned = ",".join([ad.strip() for ad in attached_devices.split(",")]) if attached_devices else None
     if not all and not from_nic:
         from_nic = "eth0"
 
@@ -491,11 +491,24 @@ def create_dhcp(ctx, filter):
             if interface['subnet_id'] == subnet['id']:
                 network = subnet
 
+
         # If we're on 10/8, switch to the right subnet.  Otherwise, switch to 10/8, then back to the right subnet.
         data = {}
         data['managed'] = True
         data['provision'] = True
         data['primary'] = True
+
+        # If this is a bond, and the type is incorrect, fix it
+        if primary['type'] != 'bond' and primary['identifier'] == "bond0":
+            print "setting to type bond"
+            data['type'] = 'bond'
+            data['attached_devices'] = 'eth0,eth1'
+
+        ## If there are no attached interfaces on a bond, add them
+        #if not primary['attached_to'] and primary['identifier'] == "bond0":
+        #    print "Attaching devices to bond"
+        #    data['attached_to'] = "eth0,eth1"
+
             
         if network and network['network'] == '10.0.0.0':
             # Just switch to the correct subnet
@@ -547,8 +560,9 @@ def create_dhcp(ctx, filter):
 @main.command()
 #@click.option('--all', is_flag=True, default=False)
 @click.option('--filter', default="os !~ Xen")
+@click.option('--detail', is_flag=True, default=False)
 @click.pass_context
-def show_nics(ctx, filter):
+def show_nics(ctx, filter, detail):
     """
     Show NICs associated with hosts from a given filter.
     """
@@ -591,7 +605,12 @@ def show_nics(ctx, filter):
                     name_conflicts += 1
 
                 #print "prim: %s, sec: %s, ips: %s, macs: %s, names: %s" % (primary['identifier'], interface['identifier'], ips_match, macs_match, names_match,)
-        print "prim: %-6s IP: %-3s Mac: %-3s Name: %-3s %s" % (primary['identifier'], ip_conflicts, mac_conflicts, name_conflicts,others,)
+        if detail:
+            attached_to = primary['attached_to'] if primary.get("attached_to") else None
+            attached_devices = primary['attached_devices'] if primary.get("attached_devices") else None
+            print "prim: %-6s type: %-10s subnet_id: %-5s managed: %-5s provision: %-5s attached_to: %-10s attached_devices: %-10s" % (primary['identifier'], primary['type'], primary['subnet_id'], primary['managed'],primary['provision'], attached_to, attached_devices,)
+        else:
+            print "prim: %-6s IP: %-3s Mac: %-3s Name: %-3s %s" % (primary['identifier'], ip_conflicts, mac_conflicts, name_conflicts,others,)
 
 
 ###############################################

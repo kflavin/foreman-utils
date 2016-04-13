@@ -317,13 +317,15 @@ def create_subnets(ctx, from_file):
     subnet['network'] = "10.230.0.0"
     subnet['mask'] = "255.255.255.252"
     subnet['gateway'] = "10.230.0.1"
-    subnet['dns_primary'] = "10.1.90.19"
+    subnet['dns_primary'] = "10.230.0.1"
     subnet['ipam'] = "DHCP"
     #subnet['domain_ids'] = [2649, 2701, 2702,]
     #subnet['dhcp_ids'] = 8
     #subnet['tftp_id'] = 8
     #subnet['dns_id'] = 8
     subnet['boot_mode'] = "DHCP"
+
+    # Not using this, because I can't get it to associate with a domain.
     subnet['domain_ids'] = [2649,]
 
     from pprint import pprint
@@ -385,7 +387,7 @@ def find_subnets(ctx, filter):
 @click.pass_context
 def update_subnets(ctx, filter):
     """
-    Print out given hosts, with current subnet, and subnet they should be on
+    Change host to the more specific subnet it should be on.
     """
     hosts = get_objs(hosts_endpoint, filter, ctx=ctx)
     subnets = get_objs(subnet_endpoint, quiet=True, ctx=ctx)
@@ -442,7 +444,7 @@ def update_subnets(ctx, filter):
 @click.pass_context
 def create_dhcp(ctx, filter):
     """
-    Switch a hosts subnets and make it managed, to recreate the DHCP record.
+    Switch a hosts subnets and make it managed, to recreate the DHCP record.  The actual DHCP record creation takes place through Foreman.
 
     This will set the host's primary interface to its correct subnet, and make that interface managed and available for provisioning.
     """
@@ -457,7 +459,7 @@ def create_dhcp(ctx, filter):
 
         # make host managed if it's not already
         if not host['managed']:
-            print host['name'], "make host managed...",
+            #print host['name'], "make host managed...",
             data = {'managed': 'true'}
             output = make_request(modify_hosts_endpoint % host['id'], data=data, content_json=True, request_type='put')
 
@@ -466,9 +468,9 @@ def create_dhcp(ctx, filter):
                 print output
                 sys.stdout.flush()
                 continue
-        else:
-            print host['name'],
-            sys.stdout.flush()
+        #else:
+        #    print host['name'],
+        #    sys.stdout.flush()
 
         interfaces = make_request(interfaces_endpoint % host['id'])
         if "results" in interfaces:
@@ -499,8 +501,7 @@ def create_dhcp(ctx, filter):
         data['primary'] = True
 
         # If this is a bond, and the type is incorrect, fix it
-        if primary['type'] != 'bond' and primary['identifier'] == "bond0":
-            print "setting to type bond"
+        if primary['identifier'].startswith("bond0"):
             data['type'] = 'bond'
             data['attached_devices'] = 'eth0,eth1'
 
@@ -510,9 +511,17 @@ def create_dhcp(ctx, filter):
         #    data['attached_to'] = "eth0,eth1"
 
             
-        if network and network['network'] == '10.0.0.0':
+        #if network and network['network'] == '10.0.0.0':
+        if not network or network['network'] == '10.0.0.0':
             # Just switch to the correct subnet
-            data['subnet_id'] = get_my_subnet(host['ip'], ctx=ctx)[0]
+            print "host", host['ip']
+            my_subnet = get_my_subnet(host['ip'], ctx=ctx)
+
+            # If there is no matching subnet, skip.
+            if not my_subnet:
+                continue
+
+            data['subnet_id'] = my_subnet[0]
             print "%s: switch to right subnet %s" % (host['name'], data['subnet_id'],)
             sys.stdout.flush()
             output = make_request(modify_interfaces_endpoint % (host['id'], primary['id'],), data=data, content_json=True, request_type='put')
